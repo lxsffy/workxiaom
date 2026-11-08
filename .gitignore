@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Build artifacts (SwiftPM / Xcode)
+.build/
+.build-*/
+dist/
+.swiftpm/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+
+# Editor / OS
+*.swp
+*~
+.idea/
+.vscode/
+
+# Backups generated during patching
+*.orig
+*.orig.*
+
+# Runtime artifacts (generated at runtime, not source)
+*.log
+recordings/
+captures/
+capture-*/
+*.wav
+*.whisper.txt

@@ -1,0 +1,357 @@
+// Copyright (c) 2026 FanXeon@Poemcoder with Codex
+import AppKit
+import ApplicationServices
+import Foundation
+
+enum CodexActivationResult: Equatable {
+    case activated
+    case launchRequested
+    case unavailable
+}
+
+enum CodexTaskDirection: Equatable {
+    case previous
+    case next
+
+    var menuItemTitles: [String] {
+        switch self {
+        case .previous: return ["Previous Task", "上一个任务", "上一个会话"]
+        case .next: return ["Next Task", "下一个任务", "下一个会话"]
+        }
+    }
+}
+
+struct CodexSubmitter {
+    static let accessibilityLaunchArgument = "--force-renderer-accessibility"
+
+    var bundleIdentifier: String
+
+    init(bundleIdentifier: String = "com.openai.codex") {
+        self.bundleIdentifier = bundleIdentifier
+    }
+
+    private var targetDisplayName: String {
+        switch bundleIdentifier {
+        case "com.openai.codex": return "Codex"
+        case "com.tencent.workbuddy.mac": return "WorkBuddy"
+        default: return bundleIdentifier
+        }
+    }
+
+    static func sanitizedLaunchEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        MiAoProcessEnvironment.sanitizedForExternalProcess(environment)
+    }
+
+    func submit(
+        _ text: String,
+        force: Bool,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                submit(text, force: force, completion: completion)
+            }
+            return
+        }
+
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(BridgeError.submission("转写为空，已取消发送")))
+            return
+        }
+
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(options) else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            completion(
+                .failure(
+                    BridgeError.submission("尚未授予辅助功能权限；transcript 已复制到剪贴板")
+                )
+            )
+            return
+        }
+
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            completion(.failure(BridgeError.submission("\(targetDisplayName) 未运行；transcript 已复制到剪贴板")))
+            return
+        }
+
+        app.activate(options: [.activateAllWindows])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            if !force {
+                let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+                guard focusCodexEditorWithAccessibility(in: applicationElement) else {
+                    copyOnly(text)
+                    completion(
+                        .failure(
+                            BridgeError.submission(
+                                "无法安全聚焦唯一的 \(targetDisplayName) 输入框；请改用 --force-submit 直接粘贴；transcript 已复制到剪贴板"
+                            )
+                        )
+                    )
+                    return
+                }
+            }
+
+            let snapshot = PasteboardSnapshot.capture()
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
+                snapshot.restore(ifUnchangedSince: pasteboard.changeCount)
+                completion(.failure(BridgeError.submission("无法写入剪贴板，已取消发送")))
+                return
+            }
+            let injectedChangeCount = pasteboard.changeCount
+            postKey(keyCode: 9, flags: .maskCommand)  // Cmd+V
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                postKey(keyCode: 36, flags: [])  // Return
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    snapshot.restore(ifUnchangedSince: injectedChangeCount)
+                    completion(.success(()))
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func activateCodex() -> Bool {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
+            return false
+        }
+        return app.activate(options: [.activateAllWindows])
+    }
+
+    func launchOrActivateCodex() -> CodexActivationResult {
+        if activateCodex() { return .activated }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        else { return .unavailable }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.arguments = [Self.accessibilityLaunchArgument]
+        configuration.environment = Self.sanitizedLaunchEnvironment()
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+            if let error {
+                fputs("启动 Codex 失败：\(error.localizedDescription)\n", stderr)
+            }
+        }
+        return .launchRequested
+    }
+
+    func editorDiagnostics() -> [String] {
+        guard
+            let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+                .first
+        else { return ["\(targetDisplayName) 未运行"] }
+        let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+        let searchRoot = elementAttribute(applicationElement, kAXFocusedWindowAttribute) ?? applicationElement
+        let focused = elementAttribute(applicationElement, kAXFocusedUIElementAttribute)
+        let candidates = findTextInputs(in: searchRoot)
+        var lines = ["候选输入控件：\(candidates.count)"]
+        if let focused {
+            lines.append("当前焦点：\(describe(element: focused))")
+        } else {
+            lines.append("当前焦点：不可读取")
+        }
+        lines.append(
+            contentsOf: candidates.enumerated().map { index, element in
+                "候选 \(index + 1)：\(describe(element: element))"
+            })
+        return lines
+    }
+
+    @discardableResult
+    func navigateTask(_ direction: CodexTaskDirection) -> Bool {
+        guard
+            let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+                .first
+        else { return false }
+        let applicationElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard
+            let menuBar = elementAttribute(applicationElement, kAXMenuBarAttribute),
+            let menuItem = findMenuItem(in: menuBar, titles: direction.menuItemTitles)
+        else { return false }
+        app.activate(options: [.activateAllWindows])
+        return AXUIElementPerformAction(menuItem, kAXPressAction as CFString) == .success
+    }
+
+    private func focusCodexEditorWithAccessibility(in applicationElement: AXUIElement) -> Bool {
+        let searchRoot = elementAttribute(applicationElement, kAXFocusedWindowAttribute) ?? applicationElement
+        let candidates = findTextInputs(in: searchRoot)
+        guard candidates.count == 1 else { return false }
+        let result = AXUIElementSetAttributeValue(
+            candidates[0],
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
+        guard result == .success else { return false }
+
+        guard let focused = elementAttribute(applicationElement, kAXFocusedUIElementAttribute) else {
+            return false
+        }
+        return CFEqual(focused, candidates[0])
+    }
+
+    private func findTextInputs(in root: AXUIElement) -> [AXUIElement] {
+        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var cursor = 0
+        var matches: [AXUIElement] = []
+
+        while cursor < queue.count, cursor < 10_000 {
+            let current = queue[cursor]
+            cursor += 1
+
+            if isAcceptedTextInput(current.element), isEnabled(current.element) {
+                matches.append(current.element)
+            }
+            guard current.depth < 50 else { continue }
+            for child in elementArrayAttribute(current.element, kAXChildrenAttribute) {
+                queue.append((child, current.depth + 1))
+            }
+        }
+        return matches
+    }
+
+    private func findMenuItem(in root: AXUIElement, titles: [String]) -> AXUIElement? {
+        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var cursor = 0
+
+        while cursor < queue.count, cursor < 1_000 {
+            let current = queue[cursor]
+            cursor += 1
+            if stringAttribute(current.element, kAXRoleAttribute) == kAXMenuItemRole as String,
+                let title = stringAttribute(current.element, kAXTitleAttribute),
+                titles.contains(title)
+            {
+                return current.element
+            }
+            guard current.depth < 5 else { continue }
+            for child in elementArrayAttribute(current.element, kAXChildrenAttribute) {
+                queue.append((child, current.depth + 1))
+            }
+        }
+        return nil
+    }
+
+    private func isAcceptedTextInput(_ element: AXUIElement) -> Bool {
+        guard let role = stringAttribute(element, kAXRoleAttribute) else { return false }
+        return [kAXTextAreaRole as String, kAXTextFieldRole as String].contains(role)
+    }
+
+    private func isEnabled(_ element: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXEnabledAttribute as CFString,
+            &value
+        )
+        return result != .success || (value as? Bool) != false
+    }
+
+    private func elementAttribute(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+            let value,
+            CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private func elementArrayAttribute(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+            let values = value as? [AXUIElement]
+        else { return [] }
+        return values
+    }
+
+    private func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+
+    private func booleanAttribute(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? Bool
+    }
+
+    private func describe(element: AXUIElement) -> String {
+        let attributes: [(String, String)] = [
+            ("role", stringAttribute(element, kAXRoleAttribute) ?? "?"),
+            ("subrole", stringAttribute(element, kAXSubroleAttribute) ?? "-"),
+            ("identifier", stringAttribute(element, kAXIdentifierAttribute) ?? "-"),
+            ("title", stringAttribute(element, kAXTitleAttribute) ?? "-"),
+            ("description", stringAttribute(element, kAXDescriptionAttribute) ?? "-"),
+            ("placeholder", stringAttribute(element, kAXPlaceholderValueAttribute) ?? "-"),
+            ("focused", booleanAttribute(element, kAXFocusedAttribute).map(String.init) ?? "?"),
+            ("enabled", booleanAttribute(element, kAXEnabledAttribute).map(String.init) ?? "?"),
+        ]
+        return attributes.map { "\($0.0)=\($0.1)" }.joined(separator: " ")
+    }
+
+    private func copyOnly(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func postKey(keyCode: CGKeyCode, flags: CGEventFlags) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        down?.flags = flags
+        up?.flags = flags
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+    }
+}
+
+enum PasteboardRestorePolicy {
+    static func shouldRestore(expectedChangeCount: Int, currentChangeCount: Int) -> Bool {
+        expectedChangeCount == currentChangeCount
+    }
+}
+
+private struct PasteboardSnapshot {
+    let items: [[NSPasteboard.PasteboardType: Data]]
+
+    static func capture() -> PasteboardSnapshot {
+        let copied = (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            Dictionary(
+                uniqueKeysWithValues: item.types.compactMap { type in
+                    item.data(forType: type).map { (type, $0) }
+                })
+        }
+        return PasteboardSnapshot(items: copied)
+    }
+
+    func restore(ifUnchangedSince expectedChangeCount: Int) {
+        let pasteboard = NSPasteboard.general
+        guard
+            PasteboardRestorePolicy.shouldRestore(
+                expectedChangeCount: expectedChangeCount,
+                currentChangeCount: pasteboard.changeCount
+            )
+        else { return }
+        pasteboard.clearContents()
+        let restored: [NSPasteboardItem] = items.map { values in
+            let item = NSPasteboardItem()
+            for (type, data) in values {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        if !restored.isEmpty { pasteboard.writeObjects(restored) }
+    }
+}
