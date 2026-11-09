@@ -75,12 +75,41 @@ scripts/install-app.sh                       # 安装到 ~/Applications/米遥.a
 - 原版 MiAo 通过辅助功能（Accessibility）树查找 Codex 唯一输入框再粘贴；这要求给 Codex 进程
   注入 `--force-renderer-accessibility` 参数。当该参数无法注入时，非 force 路径必然失败。
 - 因此本版采用 `--force-submit`：跳过焦点检测，直接 `Cmd+V` + `Return` 把文本送入当前聚焦的输入框。
-- 投递目标由 `Configuration.submitBundleID`（配置）/ `--submit-to`（命令行）控制，默认 WorkBuddy。
+- 投递目标由 `Configuration.submitBundleID`（配置）/ `--submit-to`（命令行）控制；
+  **二进制自身的默认值仍是 `com.openai.codex`**，是 app 内 `scripts/run.sh` 把默认目标固定成了 WorkBuddy。
+
+## 启动路径与开机自启（重要）
+
+只有**带 `--submit-to com.tencent.workbuddy.mac` 启动**时，文本才会投递到 WorkBuddy。
+
+- ✅ 推荐：直接打开 `米遥.app`（app 内启动脚本已固定携带该参数，且会注入设备名、连接模式、按键预设等偏好）。
+- ⚠️ 若用 LaunchAgent 或命令行**直接运行二进制**自启，必须自行补齐参数，否则会静默退回 Codex：
+
+```bash
+~/Applications/米遥.app/Contents/MacOS/mi-ao run \
+  --name 小米蓝牙语音遥控器 \
+  --voice-connection-mode always_ready \
+  --preset pointer \
+  --force-submit \
+  --submit-to com.tencent.workbuddy.mac
+```
+
+> `--force-submit` 与 `--submit-to` 缺一不可：只有前者会投到 Codex。
+> 直跑二进制不经过 `run-with-mapping.sh`，因此不会带上偏好参数，会出现
+> 「实体按键动作已禁用」、语音连接模式不是「随时就绪」，蓝牙断连后也更容易按语音键无反应。
+> 开机自启与手动打开 app **二选一**，同时存在两个实例会争抢蓝牙连接。
 
 ## 故障排查
 
 - **桥接未启动 / 没有“桥接已就绪”**：确认遥控器已开机并与 Mac 蓝牙配对；菜单栏「米遥」图标应显示已连接。
-- **文本没进 WorkBuddy**：确认 WorkBuddy 正在运行、输入框在松手瞬间是聚焦态；确认「米遥」已授予辅助功能权限。
+- **文本没进 WorkBuddy**：先用 `pgrep -fl '米遥.app/Contents/MacOS/mi-ao'` 查看进程参数里是否有
+  `--submit-to com.tencent.workbuddy.mac`。日志里的「已发送到 Codex」只是**历史遗留的硬编码文案**，
+  不代表真实投递目标；真实目标看进程参数。
+- **开机后“又不好用”**：检查是否有一个旧的 LaunchAgent 在开机时抢先启动（
+  `launchctl print gui/$(id -u)/com.fanx.miao.bridge`），其参数是否遗漏 `--submit-to`。
+- **按语音键没反应**：日志中 `interaction=0x00` 表示遥控器未进入录音交互态；
+  重启桥（或重新按一下唤醒遥控器）后应变为 `interaction=0x03`。
+- **文本没进 WorkBuddy（续）**：确认 WorkBuddy 正在运行、输入框在松手瞬间是聚焦态；确认「米遥」已授予辅助功能权限。
 - **被 Gatekeeper 拦截**：见上方“快速开始”第 1 步的 `xattr -cr`。
 
 ## 许可证
